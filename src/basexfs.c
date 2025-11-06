@@ -1,6 +1,7 @@
 
 #include <basex/basexdbc.h>
 #define FUSE_USE_VERSION 26
+#include "uthash.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -27,8 +28,23 @@
 int sfd, rc;
 #define MAX_DIR_ENTRIES INT_MAX
 
+// need this to track file "sizes" since this doesn't quite make sense for
+// basex.
+
+struct FileSize {
+    int size;
+    const char *filename;
+    UT_hash_handle hh; /* makes this structure hashable */
+};
+
+struct FileSize *filesizes = NULL;
+
 static int bxfs_getattr(const char *path, struct stat *stbuf) {
     memset(stbuf, 0, sizeof(struct stat));
+
+    int size;
+
+    const char *filename = path[0] == '/' ? path + 1 : path;
 
     if (strcmp(path, "/") == 0) {
         stbuf->st_mode = S_IFDIR | 0755;
@@ -36,24 +52,38 @@ static int bxfs_getattr(const char *path, struct stat *stbuf) {
         return 0;
     }
 
-    else {
-        char command[4 + strlen(path)];
-        const char *filename = path[0] == '/' ? path + 1 : path;
-        sprintf(command, "GET %s", filename);
-        char *result;
-        char *info;
-        const char *final_command = command;
-        int retstat = basex_execute(sfd, final_command, &result, &info);
-        if (retstat) {
-            printf("File not found: %s\n", filename);
-            return -ENOENT;
+    struct FileSize *fs;
+    if (filesizes != NULL) {
+        HASH_FIND_STR(filesizes, filename, fs);
+        if (fs != NULL) {
+            stbuf->st_size = fs->size;
+            stbuf->st_mode = S_IFREG | 0777;
+            stbuf->st_nlink = 1;
+            return 0;
         }
-        stbuf->st_size = strlen(result);
-
-        stbuf->st_mode = S_IFREG | 0777;
-        stbuf->st_nlink = 1;
-        return 0;
     }
+
+    char command[4 + strlen(path)];
+    sprintf(command, "GET %s", filename);
+    char *result;
+    char *info;
+    const char *final_command = command;
+    int retstat = basex_execute(sfd, final_command, &result, &info);
+    if (retstat) {
+        printf("File not found: %s\n", filename);
+        return -ENOENT;
+    }
+    stbuf->st_size = strlen(result);
+
+    fs = malloc(sizeof *fs);
+    char *key = malloc((strlen(filename) + 1) * sizeof(char));
+    strcpy(key, filename);
+    fs->filename = key;
+    fs->size = stbuf->st_size;
+    HASH_ADD_STR(filesizes, filename, fs);
+    stbuf->st_mode = S_IFREG | 0777;
+    stbuf->st_nlink = 1;
+    return 0;
 }
 
 char **get_dirs_from_db() {
@@ -127,7 +157,7 @@ int bxfs_open(const char *path, struct fuse_file_info *fi) {
 
 int bxfs_read(const char *path, char *buf, size_t size, off_t offset,
               struct fuse_file_info *fi) {
-    char command[4 + strlen(path)];
+    char command[5 + strlen(path)];
     const char *filename = path[0] == '/' ? path + 1 : path;
     sprintf(command, "GET %s", filename);
     char *result;
@@ -150,22 +180,30 @@ int bxfs_read(const char *path, char *buf, size_t size, off_t offset,
 int bxfs_getxattr(const char *, const char *, char *, size_t) { return 0; }
 
 int bxfs_truncate(const char *path, off_t size) {
-    char command[5 + strlen(path) + size];
+    struct FileSize *fs;
     const char *filename = path[0] == '/' ? path + 1 : path;
-    sprintf(command, "DROP %s", filename);
-    return 0;
+    HASH_FIND_STR(filesizes, filename, fs);
+    if (fs) {
+        fs->size = size;
+        return 0;
+    } else {
+        return -EINVAL;
+    }
 }
 
 int bxfs_write(const char *path, const char *buf, size_t size, off_t offset,
                struct fuse_file_info *fi) {
 
-    char command[5 + strlen(path) + size];
     const char *filename = path[0] == '/' ? path + 1 : path;
-    sprintf(command, "PUT %s %s", filename, buf);
+    char trimmed_buf[size];
+    memcpy(trimmed_buf, buf, size);
+    trimmed_buf[size] = '\0';
+    char command[4 + strlen(filename) + size];
+    sprintf(command, "PUT %s %s", filename, trimmed_buf);
     char *result;
     char *info;
     const char *final_command = command;
-    int retstat = basex_execute(sfd, final_command, &result, &info);
+    int retstat = basex_execute(sfd, command, &result, &info);
     if (retstat) {
         printf("Failed to write file: %s", filename);
         return -EINVAL;

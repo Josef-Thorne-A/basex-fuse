@@ -1,3 +1,25 @@
+/*
+Copyright (c) 2025, Josef Thorne https://github.com/Josef-Thorne-A
+https://troydhanson.github.io/uthash/ All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
 
 #include <basex/basexdbc.h>
 #define FUSE_USE_VERSION 26
@@ -33,11 +55,53 @@ int sfd, rc;
 
 struct FileSize {
     int size;
+    char *cache;
     const char *filename;
     UT_hash_handle hh; /* makes this structure hashable */
 };
 
 struct FileSize *filesizes = NULL;
+
+char **get_dirs_from_db() {
+    char *result;
+    char *info;
+    basex_execute(sfd, "DIR", &result, &info);
+    int entrylength = 50;
+    char **files = malloc(entrylength * sizeof(char *));
+    char *line;
+    char *filename;
+    // need this because strsep mangles our original string
+    char *orig_res = result;
+    strsep(&result, "\n");
+    strsep(&result, "\n");
+    for (int i = 0; 1; i++) {
+        if (i >= entrylength)
+            files = realloc(files, i * sizeof(char *) + i / 2);
+        line = strsep(&result, "\n");
+        if (line == NULL)
+            break;
+        filename = strsep(&line, " ");
+        if (filename[0] == '\n' || filename[0] == 0) {
+            files[i] = "";
+            break;
+        }
+        files[i] = malloc(sizeof(char) * strlen(filename) + 1);
+        strcpy(files[i], filename);
+    }
+    free(orig_res);
+    free(info);
+    return files;
+}
+
+int free_entries(char **entries) {
+    for (int i = 0; i < 9 && strcmp(entries[i], ""); i++) {
+        if (entries[i] != NULL)
+            free(entries[i]);
+    }
+
+    free(entries);
+    return 0;
+}
 
 static int bxfs_getattr(const char *path, struct stat *stbuf) {
     memset(stbuf, 0, sizeof(struct stat));
@@ -71,6 +135,8 @@ static int bxfs_getattr(const char *path, struct stat *stbuf) {
     int retstat = basex_execute(sfd, final_command, &result, &info);
     if (retstat) {
         printf("File not found: %s\n", filename);
+        free(result);
+        free(info);
         return -ENOENT;
     }
     stbuf->st_size = strlen(result);
@@ -79,46 +145,12 @@ static int bxfs_getattr(const char *path, struct stat *stbuf) {
     char *key = malloc((strlen(filename) + 1) * sizeof(char));
     strcpy(key, filename);
     fs->filename = key;
+    fs->cache = result;
     fs->size = stbuf->st_size;
     HASH_ADD_STR(filesizes, filename, fs);
     stbuf->st_mode = S_IFREG | 0777;
     stbuf->st_nlink = 1;
-    return 0;
-}
-
-char **get_dirs_from_db() {
-    char *result;
-    char *info;
-    basex_execute(sfd, "DIR", &result, &info);
-    int entrylength = 10;
-    char **files = malloc(entrylength * sizeof(char *));
-    char *line;
-    char *filename;
-    strsep(&result, "\n");
-    strsep(&result, "\n");
-    for (int i = 0; i < entrylength; i++) {
-        line = strsep(&result, "\n");
-        if (line == NULL)
-            break;
-        filename = strsep(&result, " ");
-        if (filename[0] == '\n') {
-            for (int j = i; j < entrylength; j++)
-                files[i] = "";
-            break;
-        }
-        files[i] = malloc(sizeof(char) * strlen(filename) + 1);
-        strcpy(files[i], filename);
-    }
-    return files;
-}
-
-int free_entries(char **entries) {
-    for (int i = 0; i < 9 && strcmp(entries[i], ""); i++) {
-        if (entries[i] != NULL)
-            free(entries[i]);
-    }
-
-    free(entries);
+    free(info);
     return 0;
 }
 
@@ -144,7 +176,7 @@ int bxfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             return 0;
         }
     }
-    // free_entries(entries);
+    free_entries(entries);
     return 0;
 }
 
@@ -157,27 +189,64 @@ int bxfs_open(const char *path, struct fuse_file_info *fi) {
 
 int bxfs_read(const char *path, char *buf, size_t size, off_t offset,
               struct fuse_file_info *fi) {
-    char command[5 + strlen(path)];
+    if (size == 0)
+        return 0;
+    char command[6 + strlen(path)];
     const char *filename = path[0] == '/' ? path + 1 : path;
     sprintf(command, "GET %s", filename);
-    char *result;
+    char *result = 0;
     char *info;
-    const char *final_command = command;
-    int retstat = basex_execute(sfd, final_command, &result, &info);
-    if (retstat) {
-        printf("File not found: %s\n", filename);
-        return -ENOENT;
+    int cached_size = 0;
+    int retstat = 0;
+    struct FileSize *fs;
+    int length;
+    if (filesizes != NULL) {
+        HASH_FIND_STR(filesizes, filename, fs);
+        if (fs != NULL && fs->cache != NULL) {
+            cached_size = fs->size;
+            result = fs->cache;
+        } else {
+            fs = malloc(sizeof *fs);
+            retstat = basex_execute(sfd, command, &result, &info);
+
+            free(info);
+            if (retstat) {
+                printf("File not found: %s\n", filename);
+                free(result);
+                return -ENOENT;
+            } else {
+
+                length = strlen(result);
+                char *key = malloc((strlen(filename) + 1) * sizeof(char));
+                fs->size = length;
+                fs->cache = result;
+                fs->filename = key;
+                HASH_ADD_STR(filesizes, filename, fs);
+            }
+        }
     }
-    int length = strlen(result);
-    if (offset >= (length - 1) || offset < 0)
+    length = fs->size;
+    if (offset >= (length) || offset < 0)
         return 0;
 
-    const char *to_read = result + offset;
-    strncpy(buf, to_read, size);
-    return strlen(buf);
+    char selected_text[size + 1];
+    strlcpy(selected_text, result + offset, size + 1);
+    const char *to_read = selected_text;
+
+    const int bytes_read = strlen((const char *)to_read);
+    memcpy(buf, (const char *)to_read, size);
+    if (bytes_read > size) {
+        printf("READ MORE BYTES THAN SIZE, SHOULD NOT HAPPEN");
+        return -1;
+    } else if (bytes_read < size) {
+        printf("BYTES NOT AS MUCH AS SIZE: %ld %d", size, bytes_read);
+        return bytes_read;
+    } else {
+        return bytes_read;
+    }
 }
 
-int bxfs_getxattr(const char *, const char *, char *, size_t) { return 0; }
+int bxfs_getxattr(const char *a, const char *b, char *c, size_t d) { return 0; }
 
 int bxfs_truncate(const char *path, off_t size) {
     struct FileSize *fs;
@@ -195,10 +264,9 @@ int bxfs_write(const char *path, const char *buf, size_t size, off_t offset,
                struct fuse_file_info *fi) {
 
     const char *filename = path[0] == '/' ? path + 1 : path;
-    char trimmed_buf[size];
-    memcpy(trimmed_buf, buf, size);
-    trimmed_buf[size] = '\0';
-    char command[4 + strlen(filename) + size];
+    char trimmed_buf[size + 1];
+    strlcpy(trimmed_buf, buf, size + 1);
+    char command[5 + strlen(filename) + size];
     sprintf(command, "PUT %s %s", filename, trimmed_buf);
     char *result;
     char *info;
@@ -208,8 +276,11 @@ int bxfs_write(const char *path, const char *buf, size_t size, off_t offset,
         printf("Failed to write file: %s", filename);
         return -EINVAL;
     }
+    free(result);
+    free(info);
     return size;
 }
+
 static struct fuse_operations prefix_oper = {
     .getattr = bxfs_getattr,
     .read = bxfs_read,
@@ -226,30 +297,45 @@ static struct fuse_operations prefix_oper = {
 
 int main(int argc, char *argv[]) {
 
-    sfd = basex_connect(DBHOST, DBPORT);
+    char *dbhost = getenv("DBHOST");
+    dbhost = dbhost ? dbhost : DBHOST;
+    printf("%s", dbhost);
+
+    char *dbport = getenv("DBPORT");
+    dbport = dbport ? dbhost : DBPORT;
+
+    sfd = basex_connect(dbhost, dbport);
     if (sfd == -1) {
         warnx("Cannot connect to BaseX server.");
         return -1;
     }
+    char *dbuser = getenv("DBUSER");
+    dbuser = dbuser ? dbuser : DBUSER;
 
-    rc = basex_authenticate(sfd, DBUSER, DBPASSWD);
+    char *dbpasswd = getenv("DBPASSWD");
+    dbpasswd = dbpasswd ? dbpasswd : DBPASSWD;
+
+    rc = basex_authenticate(sfd, dbuser, dbpasswd);
     if (rc == -1) {
         warnx("Access to DB denied.");
         goto err_out;
     }
-
+    char opendb[100] = "OPEN ";
+    char *dbname = getenv("DBNAME");
+    dbname = dbname ? dbname : "NewRLE";
+    strcat(opendb, dbname);
     printf("opening DB\n");
     char *result;
     char *info;
-    rc = basex_execute(sfd, "OPEN NewRLE", &result, &info);
+    rc = basex_execute(sfd, opendb, &result, &info);
     if (rc == -1) {
         warnx("Failed to open DB\n");
     }
-    char **entries = get_dirs_from_db();
-    for (int i = 0; entries[i] != NULL; i++)
-        printf("%s\n", entries[i]);
+    free(result);
+    free(info);
     umask(0);
     return fuse_main(argc, argv, &prefix_oper, NULL);
+
     return 0;
 err_out:
     basex_close(sfd);

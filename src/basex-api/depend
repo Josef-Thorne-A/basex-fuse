@@ -1,0 +1,4 @@
+basexdbc.o: basexdbc.c basexdbc.h md5.h readstring.h
+example.o: example.c basexdbc.h
+md5.o: md5.c md5.h
+readstring.o: readstring.c readstring.h

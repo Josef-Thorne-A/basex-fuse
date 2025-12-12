@@ -29,8 +29,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <errno.h>
 #include <fcntl.h>
 #include <fuse.h>
+#include <fuse/fuse.h>
 #include <libgen.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -264,21 +266,64 @@ int bxfs_write(const char *path, const char *buf, size_t size, off_t offset,
                struct fuse_file_info *fi) {
 
     const char *filename = path[0] == '/' ? path + 1 : path;
-    char trimmed_buf[size + 1];
-    strlcpy(trimmed_buf, buf, size + 1);
-    char command[5 + strlen(filename) + size];
-    sprintf(command, "PUT %s %s", filename, trimmed_buf);
-    char *result;
-    char *info;
-    const char *final_command = command;
-    int retstat = basex_execute(sfd, command, &result, &info);
-    if (retstat) {
-        printf("Failed to write file: %s", filename);
-        return -EINVAL;
+    struct FileSize *fs;
+    if (filesizes != NULL) {
+        HASH_FIND_STR(filesizes, filename, fs);
+        if (fs != NULL) {
+            if (offset + size > (fs->size)) {
+                fs->cache = realloc(fs->cache, sizeof(char) * offset + size);
+                fs->size = offset + size;
+            }
+            memcpy(fs->cache + offset, buf, size);
+            return size;
+        } else {
+            fs = malloc(sizeof(struct FileSize));
+            char *key = malloc((strlen(filename) + 1) * sizeof(char));
+            fs->size = size;
+            fs->cache = malloc(size);
+            fs->filename = key;
+            memcpy(fs->cache, buf, size);
+            HASH_ADD_STR(filesizes, filename, fs);
+            return size;
+        }
+    } else {
+        return -EINTR;
     }
-    free(result);
-    free(info);
-    return size;
+}
+
+int bxfs_fsync(const char *path, int isdatasync, struct fuse_file_info *fi) {
+    const char *filename = path[0] == '/' ? path + 1 : path;
+    int size;
+    struct FileSize *fs;
+    if (filesizes != NULL) {
+        HASH_FIND_STR(filesizes, filename, fs);
+        if (fs != NULL) {
+            size = fs->size;
+            char file[size + 1];
+            strlcpy(file, fs->cache, size + 1);
+            char command[5 + strlen(filename) + size];
+            sprintf(command, "PUT %s %s", filename, file);
+            const char *final_command = command;
+            char *result;
+            char *info;
+
+            int retstat = basex_execute(sfd, command, &result, &info);
+            free(result);
+            free(info);
+            if (retstat) {
+                printf("Failed to write file: %s", filename);
+                return -1;
+            } else {
+                return 0;
+            }
+        }
+    } else {
+        return -1;
+    }
+}
+
+int bxfs_release(const char *path, struct fuse_file_info *fi) {
+    return bxfs_fsync(path, 0, fi);
 }
 
 static struct fuse_operations prefix_oper = {
@@ -288,6 +333,8 @@ static struct fuse_operations prefix_oper = {
     .readdir = bxfs_readdir,
     .write = bxfs_write,
     .truncate = bxfs_truncate,
+    .fsync = bxfs_fsync,
+    .release = bxfs_release,
 #ifdef HAVE_SETXATTR
     .getxattr = bxfs_getxattr,
     .listxattr = bxfs_listxattr,
@@ -334,9 +381,9 @@ int main(int argc, char *argv[]) {
     free(result);
     free(info);
     umask(0);
-    return fuse_main(argc, argv, &prefix_oper, NULL);
+    struct fuse_conn_info fconn;
+    return fuse_main(argc, argv, &prefix_oper, &fconn);
 
-    return 0;
 err_out:
     basex_close(sfd);
     return -1;

@@ -1,6 +1,5 @@
 /*
 Copyright (c) 2025, Josef Thorne https://github.com/Josef-Thorne-A
-https://troydhanson.github.io/uthash/ All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -21,7 +20,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include <basex/basexdbc.h>
+#include "basex-api/basexdbc.h"
 #define FUSE_USE_VERSION 26
 #include "uthash.h"
 #include <ctype.h>
@@ -44,6 +43,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define DBPORT "1984"
 #define DBUSER "admin"
 #define DBPASSWD "test"
+#define DBNAME "default"
 
 #ifdef HAVE_SYS_XATTR_H
 #include <sys/xattr.h>
@@ -369,7 +369,7 @@ int main(int argc, char *argv[]) {
     }
     char opendb[100] = "OPEN ";
     char *dbname = getenv("DBNAME");
-    dbname = dbname ? dbname : "NewRLE";
+    dbname = dbname ? dbname : DBNAME;
     strcat(opendb, dbname);
     printf("opening DB\n");
     char *result;

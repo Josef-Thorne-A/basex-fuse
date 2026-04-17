@@ -22,6 +22,7 @@ You will need to have basex running on a server. By default, it expects the defa
 The following environment variables exist to control connection parameters:
 
 | Variable | Description                           | Default Value |
+---------------------
 | DBHOST   | The hostname of the database          | localhost     |
 | DBPORT   | The port the database is listening on | 1984          |
 | DBUSER   | Database user to login as             | admin         |
